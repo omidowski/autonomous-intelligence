@@ -1,0 +1,12 @@
+services:
+  api:
+    build: .
+    env_file:
+      - .env
+    environment:
+      AI_PROVIDER: ${DOCKER_AI_PROVIDER:-demo}
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./output:/app/output
+      - ./data:/app/data

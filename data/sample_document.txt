@@ -1,0 +1,1 @@
+Agentic AI systems typically combine a language model with tools, memory, retrieval and an orchestration loop. Production systems should be evaluated for task success, factuality, security, latency and cost. High-impact actions should use explicit permissions and human approval where appropriate.
