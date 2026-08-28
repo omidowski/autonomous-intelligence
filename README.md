@@ -208,6 +208,10 @@ Approved content can be queued to go out later instead of only "publish now".
 - The existing scheduler loop drains due slots every 60s. Approval is re-checked at send
   time: content rejected between scheduling and its slot is **failed, not posted**. A failed
   slot is never retried, so a broken bundle can't cause a retry storm.
+- Because content can now sit queued for days, **approval can be withdrawn**
+  (`approved -> rejected`, "Withdraw approval" in the UI). That single action stops every
+  queued slot for the bundle at once, instead of having to cancel each one and risk missing
+  one. It does not retract anything already published.
 
 ### Real vs. stubbed platforms
 

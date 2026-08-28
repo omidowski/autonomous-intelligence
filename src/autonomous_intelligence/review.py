@@ -17,8 +17,19 @@ ALLOWED_TRANSITIONS: dict[ContentStatus, set[ContentStatus]] = {
     ContentStatus.draft: {ContentStatus.pending_review},
     ContentStatus.pending_review: {ContentStatus.approved, ContentStatus.rejected},
     ContentStatus.rejected: {ContentStatus.pending_review},
-    ContentStatus.approved: set(),
+    ContentStatus.approved: {ContentStatus.rejected},
 }
+"""Approval is deliberately *not* terminal: `approved -> rejected` withdraws
+it. That mattered little while publishing was immediate (approve, publish,
+done), but approved content can now sit in the `scheduled_posts` queue for
+days before its slot comes up - without a withdraw path, a mistake spotted
+after approval could only be undone by cancelling every queued slot one at
+a time, and a slot that was missed would still go out. Withdrawing
+approval fails the queued posts at send time instead
+(`scheduler.publish_due_posts`).
+
+Rejecting does not retract anything already published - `publish_log` is a
+record of what actually went out, not of what is currently approved."""
 
 
 class InvalidTransition(ValueError):

@@ -1,0 +1,11 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "autonomous-intelligence",
+      "runtimeExecutable": ".venv/bin/uvicorn",
+      "runtimeArgs": ["autonomous_intelligence.api:app", "--reload", "--port", "8000"],
+      "port": 8000
+    }
+  ]
+}

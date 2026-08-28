@@ -155,13 +155,22 @@ def test_publish_due_posts_ignores_future_slots(client, signup):
     assert client.get("/schedule").json()[0]["status"] == "pending"
 
 
+def test_approval_can_be_withdrawn_while_a_post_is_queued(client, signup):
+    """Approval is not terminal precisely because scheduling exists - see
+    `review.ALLOWED_TRANSITIONS`."""
+    date = _approved_run(client, signup)
+    r = client.post(f"/daily-content/{date}/trend/1/reject", json={})
+    assert r.status_code == 200
+    assert r.json()["status"] == "rejected"
+
+
 def test_publish_due_posts_fails_closed_when_approval_is_withdrawn(client, signup):
     """The real risk this guards: content approved when scheduled, then
     rejected before the slot comes up, must not go out."""
     date = _approved_run(client, signup)
     settings = get_settings()
     _make_due(settings, 1, date)
-    client.post(f"/daily-content/{date}/trend/1/reject", json={})
+    assert client.post(f"/daily-content/{date}/trend/1/reject", json={}).status_code == 200
 
     assert scheduler.publish_due_posts(settings) == 0
     row = client.get("/schedule").json()[0]
@@ -173,7 +182,7 @@ def test_a_failed_post_is_not_retried_on_the_next_tick(client, signup):
     date = _approved_run(client, signup)
     settings = get_settings()
     _make_due(settings, 1, date)
-    client.post(f"/daily-content/{date}/trend/1/reject", json={})
+    assert client.post(f"/daily-content/{date}/trend/1/reject", json={}).status_code == 200
 
     scheduler.publish_due_posts(settings)
     # Second tick sees nothing pending - no retry storm.

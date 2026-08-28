@@ -2317,7 +2317,7 @@ const REVIEW_TRANSITIONS = {
   draft: [{action:'submit-for-review', label:'Submit for review'}],
   pending_review: [{action:'approve', label:'Approve'}, {action:'reject', label:'Reject'}],
   rejected: [{action:'submit-for-review', label:'Resubmit for review'}],
-  approved: [{action:'publish', label:'Publish now'}]
+  approved: [{action:'publish', label:'Publish now'}, {action:'reject', label:'Withdraw approval'}]
 };
 const REVIEW_STATUS_LABEL = {draft:'Draft', pending_review:'Pending review', approved:'Approved', rejected:'Rejected'};
 const REVIEW_ACTION_RESULT_STATUS = {
@@ -2336,7 +2336,7 @@ async function reviewAction(context, date, trendIndex, action, btn){
       try { const errData = await r.json(); if (errData.detail) detail = JSON.stringify(errData.detail); } catch(e){}
       throw new Error(detail);
     }
-    showToast(action === 'publish' ? 'Published (stub).' : REVIEW_STATUS_LABEL[REVIEW_ACTION_RESULT_STATUS[action]] + '.');
+    showToast(action === 'publish' ? 'Published.' : REVIEW_STATUS_LABEL[REVIEW_ACTION_RESULT_STATUS[action]] + '.');
     if (context === 'custom'){ loadCustomContentRun(date); } else { loadDailyContentDate(date); }
   }catch(e){
     document.getElementById(errorBoxId).innerHTML = '<div class="error-card">' + esc(e.message || String(e)) + '</div>';
