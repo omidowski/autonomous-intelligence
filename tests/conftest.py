@@ -13,6 +13,24 @@ def client(tmp_path, monkeypatch):
     (not import time), so clearing the cache after patching env vars is
     enough - no module reload needed."""
     monkeypatch.setenv("AI_PROVIDER", "demo")
+    # The media agents fall back to real third-party providers whenever a key
+    # is configured, and `Settings` reads the developer's own `.env` - so
+    # without this the suite quietly billed/called Pexels, ElevenLabs, Runway
+    # et al. on every `/daily-content/run`. That was slow (minutes per test,
+    # dominated by network retries) and made results depend on whose machine
+    # they ran on. Blanking the keys forces every agent down its offline
+    # placeholder tier, which is what the assertions actually describe.
+    for provider_key in (
+        "LEONARDO_API_KEY",
+        "PEXELS_API_KEY",
+        "ELEVENLABS_API_KEY",
+        "RUNWAY_API_KEY",
+        "KLING_ACCESS_KEY",
+        "KLING_SECRET_KEY",
+        "HEYGEN_API_KEY",
+        "HEYGEN_AVATAR_ID",
+    ):
+        monkeypatch.setenv(provider_key, "")
     monkeypatch.setenv("DATABASE_PATH", str(tmp_path / "app.db"))
     monkeypatch.setenv("DAILY_CONTENT_OUTPUT_DIR", str(tmp_path / "output"))
     monkeypatch.setenv("BRAND_ASSETS_DIR", str(tmp_path / "assets"))
