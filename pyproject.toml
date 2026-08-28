@@ -23,6 +23,7 @@ dependencies = [
   "imageio-ffmpeg>=0.5,<1",
   "python-multipart>=0.0.12,<1",
   "stripe>=11.1,<12",
+  "flask>=3.0,<4",
 ]
 
 [project.optional-dependencies]
@@ -41,7 +42,7 @@ postgres = [
 packages = ["src/autonomous_intelligence"]
 
 [tool.pytest.ini_options]
-pythonpath = ["src"]
+pythonpath = ["src", "."]
 testpaths = ["tests"]
 
 [tool.ruff]

@@ -284,11 +284,27 @@ A research run produces:
 }
 ```
 
+## Flask companion API
+
+Alongside the FastAPI platform, `flask_app/` is a small, self-contained Flask
+service for a single use case: brief a post, get two copy variants (A/B) and a
+weighted comparative analysis of them, across a multi-turn conversation whose
+history lives in SQLite. It reuses `autonomous_intelligence.llm.LLMProvider`, so
+the same providers apply, and runs offline (schema-conformant placeholders) when
+none is configured.
+
+```bash
+flask --app flask_app.wsgi run --debug --port 5001
+```
+
+See [flask_app/README.md](flask_app/README.md) for the endpoint map, the two
+prompt-engineering techniques and the scoring model.
+
 ## Tests
 
 ```bash
 pytest -q
-ruff check src tests
+ruff check src flask_app tests
 ```
 
 Tests run without an API key, and the full suite finishes in well under a
