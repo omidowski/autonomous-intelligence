@@ -1,8 +1,39 @@
 import pytest
 from fastapi.testclient import TestClient
 
+from autonomous_intelligence import daily_content_orchestrator
+from autonomous_intelligence.agents.video_assembler import VideoAssembler
 from autonomous_intelligence.api import app
 from autonomous_intelligence.config import get_settings
+
+PREVIEW_VIDEO_SIZE = (96, 170)
+PREVIEW_VIDEO_FPS = 6
+"""Frame size/rate for video assembly under test. `DailyContentOrchestrator`
+defaults to 1080x1920 @ 30fps at 8000k - correct for the product, ruinous for
+a test suite: every `/daily-content/run` spent ~60s in ffmpeg, which is what
+made a full run take the better part of an hour. These are the same numbers
+`test_media_agents.py` and `test_daily_content_orchestrator.py` already use
+when they construct a `VideoAssembler` directly."""
+
+
+@pytest.fixture(autouse=True)
+def preview_video_assembly(monkeypatch):
+    """Render thumbnail-sized videos everywhere the orchestrator builds its
+    own `VideoAssembler`.
+
+    The whole code path still runs for real - Ken Burns move, progressive
+    captions, crossfades, ffmpeg, h264 - so assertions about a real, playable
+    file remain honest. Only the frame size and rate change. Tests that want
+    a specific assembler still pass one explicitly; this only supplies the
+    default, so it does not override them.
+    """
+
+    def preview_assembler(*args, **kwargs):
+        kwargs.setdefault("size", PREVIEW_VIDEO_SIZE)
+        kwargs.setdefault("fps", PREVIEW_VIDEO_FPS)
+        return VideoAssembler(*args, **kwargs)
+
+    monkeypatch.setattr(daily_content_orchestrator, "VideoAssembler", preview_assembler)
 
 
 @pytest.fixture

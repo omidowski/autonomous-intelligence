@@ -65,7 +65,7 @@ def test_publish_after_approve_writes_results_per_platform(client, signup):
 
 
 def test_publish_uses_selected_variant(client, signup, monkeypatch):
-    from autonomous_intelligence import review_api
+    from autonomous_intelligence import publishing
     from autonomous_intelligence.publishers.base import PublishResult
 
     published_texts = []
@@ -76,7 +76,11 @@ def test_publish_uses_selected_variant(client, signup, monkeypatch):
             published_texts.append(post.text)
             return PublishResult(platform=platform, success=True, external_id="rec-1", detail="")
 
-    monkeypatch.setattr(review_api, "get_publisher", lambda name="stub": RecordingPublisher())
+    # `review_api.publish` delegates to `publishing.publish_bundle_platforms`,
+    # which resolves the publisher through its own module-level import - so
+    # `publishing` is the binding that has to be replaced, not `review_api`
+    # (which never imported the name at all).
+    monkeypatch.setattr(publishing, "get_publisher", lambda name="stub": RecordingPublisher())
 
     signup(client)
     run = client.post("/daily-content/run")
@@ -96,7 +100,7 @@ def test_publish_uses_selected_variant(client, signup, monkeypatch):
 
 
 def test_publish_defaults_to_variant_a_when_unselected(client, signup, monkeypatch):
-    from autonomous_intelligence import review_api
+    from autonomous_intelligence import publishing
     from autonomous_intelligence.publishers.base import PublishResult
 
     published_texts = []
@@ -107,7 +111,11 @@ def test_publish_defaults_to_variant_a_when_unselected(client, signup, monkeypat
             published_texts.append(post.text)
             return PublishResult(platform=platform, success=True, external_id="rec-1", detail="")
 
-    monkeypatch.setattr(review_api, "get_publisher", lambda name="stub": RecordingPublisher())
+    # `review_api.publish` delegates to `publishing.publish_bundle_platforms`,
+    # which resolves the publisher through its own module-level import - so
+    # `publishing` is the binding that has to be replaced, not `review_api`
+    # (which never imported the name at all).
+    monkeypatch.setattr(publishing, "get_publisher", lambda name="stub": RecordingPublisher())
 
     signup(client)
     run = client.post("/daily-content/run")

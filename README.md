@@ -291,7 +291,11 @@ pytest -q
 ruff check src tests
 ```
 
-Tests run without an API key.
+Tests run without an API key, and the full suite finishes in well under a
+minute. The `client` fixture blanks every media-provider key so no test calls
+a third-party API, and an autouse fixture renders video assembly at 96x170 @
+6fps instead of the product default of 1080x1920 @ 30fps - the whole ffmpeg
+path still runs, just small enough not to dominate the run.
 
 ## Docker
 
