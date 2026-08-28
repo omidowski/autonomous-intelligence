@@ -130,6 +130,48 @@ def init_db(db_path: str | Path) -> None:
                 updated_at TEXT NOT NULL,
                 UNIQUE(company_id, date, trend_index, platform)
             );
+
+            CREATE TABLE IF NOT EXISTS stripe_events (
+                event_id TEXT PRIMARY KEY,
+                event_type TEXT NOT NULL,
+                received_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS api_keys (
+                id INTEGER PRIMARY KEY,
+                company_id INTEGER NOT NULL REFERENCES companies(id),
+                name TEXT NOT NULL,
+                prefix TEXT NOT NULL,
+                key_hash TEXT NOT NULL UNIQUE,
+                created_at TEXT NOT NULL,
+                last_used_at TEXT,
+                revoked INTEGER NOT NULL DEFAULT 0
+            );
+
+            CREATE TABLE IF NOT EXISTS scheduled_posts (
+                id INTEGER PRIMARY KEY,
+                company_id INTEGER NOT NULL REFERENCES companies(id),
+                date TEXT NOT NULL,
+                trend_index INTEGER NOT NULL,
+                platform TEXT NOT NULL,
+                scheduled_for TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending',
+                external_id TEXT,
+                detail TEXT,
+                created_at TEXT NOT NULL,
+                published_at TEXT,
+                UNIQUE(company_id, date, trend_index, platform, scheduled_for)
+            );
+
+            CREATE TABLE IF NOT EXISTS company_webhooks (
+                id INTEGER PRIMARY KEY,
+                company_id INTEGER NOT NULL REFERENCES companies(id),
+                url TEXT NOT NULL,
+                secret TEXT NOT NULL,
+                event_types TEXT NOT NULL DEFAULT 'all',
+                active INTEGER NOT NULL DEFAULT 1,
+                created_at TEXT NOT NULL
+            );
             """
         )
         # `brand_voice` was added after the initial `companies` table shipped -
@@ -308,6 +350,230 @@ def update_company_subscription(
                 (plan, status, company_id),
             )
         conn.commit()
+    finally:
+        conn.close()
+
+
+def record_stripe_event(db_path: str | Path, event_id: str, event_type: str) -> bool:
+    """Records a Stripe webhook `event_id` and returns `True` if it was new.
+    `False` means this exact event was already handled - Stripe retries
+    delivery (up to 3 days) on any non-2xx or timeout, so the handler in
+    `billing_api.py` calls this first and no-ops on a repeat. The row is
+    written before the event is processed: every current handler is an
+    idempotent UPSERT so a re-delivery after a mid-processing crash is
+    harmless to skip; revisit if a non-idempotent handler is added."""
+    conn = get_connection(db_path)
+    try:
+        cur = conn.execute(
+            "INSERT OR IGNORE INTO stripe_events (event_id, event_type, received_at) "
+            "VALUES (?, ?, ?)",
+            (event_id, event_type, _now()),
+        )
+        conn.commit()
+        return cur.rowcount == 1
+    finally:
+        conn.close()
+
+
+def schedule_post(
+    db_path: str | Path,
+    *,
+    company_id: int,
+    date: str,
+    trend_index: int,
+    platform: str,
+    scheduled_for: str,
+) -> int | None:
+    """Queues one platform post for a future time. Returns the new row id,
+    or `None` if this exact slot is already queued - the UNIQUE constraint
+    makes double-booking a no-op rather than an error, so a retried request
+    can't create duplicate posts."""
+    conn = get_connection(db_path)
+    try:
+        cur = conn.execute(
+            "INSERT OR IGNORE INTO scheduled_posts "
+            "(company_id, date, trend_index, platform, scheduled_for, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (company_id, date, trend_index, platform, scheduled_for, _now()),
+        )
+        conn.commit()
+        return int(cur.lastrowid) if cur.rowcount == 1 else None
+    finally:
+        conn.close()
+
+
+def list_scheduled_posts(
+    db_path: str | Path, company_id: int, *, status: str | None = None
+) -> list[sqlite3.Row]:
+    conn = get_connection(db_path)
+    try:
+        sql = "SELECT * FROM scheduled_posts WHERE company_id = ?"
+        params: list[object] = [company_id]
+        if status:
+            sql += " AND status = ?"
+            params.append(status)
+        return conn.execute(sql + " ORDER BY scheduled_for", params).fetchall()
+    finally:
+        conn.close()
+
+
+def list_due_scheduled_posts(db_path: str | Path, *, now_iso: str) -> list[sqlite3.Row]:
+    """Every pending post across all companies whose time has come - the
+    scheduler's work queue."""
+    conn = get_connection(db_path)
+    try:
+        return conn.execute(
+            "SELECT * FROM scheduled_posts WHERE status = 'pending' AND scheduled_for <= ? "
+            "ORDER BY scheduled_for",
+            (now_iso,),
+        ).fetchall()
+    finally:
+        conn.close()
+
+
+def mark_scheduled_post(
+    db_path: str | Path,
+    post_id: int,
+    *,
+    status: str,
+    external_id: str | None = None,
+    detail: str | None = None,
+) -> None:
+    conn = get_connection(db_path)
+    try:
+        conn.execute(
+            "UPDATE scheduled_posts SET status = ?, external_id = ?, detail = ?, "
+            "published_at = ? WHERE id = ?",
+            (status, external_id, detail, _now(), post_id),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def cancel_scheduled_post(db_path: str | Path, company_id: int, post_id: int) -> bool:
+    """Only a still-pending post can be canceled - one already published
+    cannot be un-published from here."""
+    conn = get_connection(db_path)
+    try:
+        cur = conn.execute(
+            "UPDATE scheduled_posts SET status = 'canceled' "
+            "WHERE id = ? AND company_id = ? AND status = 'pending'",
+            (post_id, company_id),
+        )
+        conn.commit()
+        return cur.rowcount > 0
+    finally:
+        conn.close()
+
+
+def create_api_key(
+    db_path: str | Path, *, company_id: int, name: str, prefix: str, key_hash: str
+) -> int:
+    conn = get_connection(db_path)
+    try:
+        cur = conn.execute(
+            "INSERT INTO api_keys (company_id, name, prefix, key_hash, created_at) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (company_id, name, prefix, key_hash, _now()),
+        )
+        conn.commit()
+        return int(cur.lastrowid)
+    finally:
+        conn.close()
+
+
+def list_api_keys(db_path: str | Path, company_id: int) -> list[sqlite3.Row]:
+    """Every key for the company, revoked ones included - the UI shows them
+    struck through rather than hiding that they ever existed."""
+    conn = get_connection(db_path)
+    try:
+        return conn.execute(
+            "SELECT * FROM api_keys WHERE company_id = ? ORDER BY id DESC", (company_id,)
+        ).fetchall()
+    finally:
+        conn.close()
+
+
+def get_api_key_by_hash(db_path: str | Path, key_hash: str) -> sqlite3.Row | None:
+    """Looks a presented key up by its hash. Revoked keys are not returned,
+    so revocation takes effect on the very next request."""
+    conn = get_connection(db_path)
+    try:
+        return conn.execute(
+            "SELECT * FROM api_keys WHERE key_hash = ? AND revoked = 0", (key_hash,)
+        ).fetchone()
+    finally:
+        conn.close()
+
+
+def touch_api_key(db_path: str | Path, key_id: int) -> None:
+    conn = get_connection(db_path)
+    try:
+        conn.execute("UPDATE api_keys SET last_used_at = ? WHERE id = ?", (_now(), key_id))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def revoke_api_key(db_path: str | Path, company_id: int, key_id: int) -> bool:
+    """Soft delete - the row stays so `last_used_at` remains auditable after
+    a key is turned off."""
+    conn = get_connection(db_path)
+    try:
+        cur = conn.execute(
+            "UPDATE api_keys SET revoked = 1 WHERE id = ? AND company_id = ? AND revoked = 0",
+            (key_id, company_id),
+        )
+        conn.commit()
+        return cur.rowcount > 0
+    finally:
+        conn.close()
+
+
+def create_company_webhook(
+    db_path: str | Path,
+    *,
+    company_id: int,
+    url: str,
+    secret: str,
+    event_types: str = "all",
+) -> int:
+    conn = get_connection(db_path)
+    try:
+        cur = conn.execute(
+            "INSERT INTO company_webhooks (company_id, url, secret, event_types, created_at) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (company_id, url, secret, event_types, _now()),
+        )
+        conn.commit()
+        return int(cur.lastrowid)
+    finally:
+        conn.close()
+
+
+def list_company_webhooks(
+    db_path: str | Path, company_id: int, *, active_only: bool = False
+) -> list[sqlite3.Row]:
+    conn = get_connection(db_path)
+    try:
+        sql = "SELECT * FROM company_webhooks WHERE company_id = ?"
+        if active_only:
+            sql += " AND active = 1"
+        return conn.execute(sql + " ORDER BY id", (company_id,)).fetchall()
+    finally:
+        conn.close()
+
+
+def delete_company_webhook(db_path: str | Path, company_id: int, webhook_id: int) -> bool:
+    conn = get_connection(db_path)
+    try:
+        cur = conn.execute(
+            "DELETE FROM company_webhooks WHERE id = ? AND company_id = ?",
+            (webhook_id, company_id),
+        )
+        conn.commit()
+        return cur.rowcount > 0
     finally:
         conn.close()
 
@@ -692,8 +958,13 @@ def delete_brand_asset(db_path: str | Path, company_id: int, asset_id: int) -> N
 
 
 __all__ = [
+    "cancel_scheduled_post",
+    "create_api_key",
+    "create_company_webhook",
     "delete_brand_asset",
+    "delete_company_webhook",
     "delete_session",
+    "get_api_key_by_hash",
     "get_brand_asset",
     "get_bundle_status_row",
     "get_company_by_id",
@@ -715,13 +986,22 @@ __all__ = [
     "insert_session",
     "insert_usage_log",
     "insert_user",
+    "list_api_keys",
     "list_brand_assets",
     "list_companies_with_schedule_enabled",
+    "list_company_webhooks",
+    "list_due_scheduled_posts",
     "list_research_reports",
+    "list_scheduled_posts",
     "list_users_for_company",
     "mark_company_run",
+    "mark_scheduled_post",
+    "record_stripe_event",
+    "revoke_api_key",
+    "schedule_post",
     "set_selected_variant",
     "set_stripe_customer_id",
+    "touch_api_key",
     "update_company_brand_voice",
     "update_company_content_model",
     "update_company_content_settings",

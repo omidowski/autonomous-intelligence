@@ -104,6 +104,23 @@ class Settings(BaseSettings):
     pretending a checkout succeeded would be actively misleading rather
     than a harmless placeholder. Get keys at https://dashboard.stripe.com/apikeys
     and https://dashboard.stripe.com/webhooks."""
+    linkedin_access_token: str | None = None
+    linkedin_author_urn: str | None = None
+    x_access_token: str | None = None
+    facebook_page_access_token: str | None = None
+    facebook_page_id: str | None = None
+    """Real social publishing credentials (`publishers/social.py`). Each
+    platform is independent: set only the ones you have, and the rest keep
+    using the no-network `StubPublisher`. Unlike the media fallbacks above,
+    an *absent* credential here never degrades into a silent fake success -
+    publishing to an unconfigured platform is reported as a failed publish,
+    because a post that didn't happen must never look like one that did.
+    LinkedIn needs a `w_member_social` token plus the author URN
+    (https://www.linkedin.com/developers/apps), X an OAuth 2.0 user token
+    with `tweet.write` (https://developer.x.com/en/portal/dashboard), and
+    Facebook a Page token with `pages_manage_posts` plus the Page id
+    (https://developers.facebook.com/apps)."""
+
     stripe_price_id_starter: str | None = None
     stripe_price_id_pro: str | None = None
     """Stripe Price IDs (`price_...`) for the two paid plans in

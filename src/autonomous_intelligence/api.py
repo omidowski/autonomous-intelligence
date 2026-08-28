@@ -7,12 +7,34 @@ from pathlib import Path
 from typing import Any
 
 from fastapi import Depends, FastAPI, HTTPException
-from fastapi.responses import FileResponse, HTMLResponse
+from fastapi.responses import FileResponse, HTMLResponse, Response
 
-from . import assets_api, auth, auth_api, billing_api, db, review, review_api, scheduler, usage
+from . import (
+    api_keys_api,
+    assets_api,
+    auth,
+    auth_api,
+    billing_api,
+    db,
+    exports,
+    model_catalog,
+    plans,
+    review,
+    review_api,
+    schedule_api,
+    scheduler,
+    usage,
+    webhooks_api,
+)
 from .config import Settings, get_settings
 from .daily_content_orchestrator import DailyContentOrchestrator
-from .models import CustomContentRequest, ResearchReport, ResearchRequest
+from .models import (
+    BulkCustomContentRequest,
+    CustomContentRequest,
+    MultiModelContentRequest,
+    ResearchReport,
+    ResearchRequest,
+)
 from .orchestrator import ResearchOrchestrator
 from .tenancy import tenant_output_dir
 
@@ -42,6 +64,9 @@ app.include_router(auth_api.router)
 app.include_router(review_api.router)
 app.include_router(assets_api.router)
 app.include_router(billing_api.router)
+app.include_router(webhooks_api.router)
+app.include_router(api_keys_api.router)
+app.include_router(schedule_api.router)
 
 
 @app.get("/media/{company_slug}/{file_path:path}")
@@ -114,13 +139,37 @@ def health() -> dict[str, str | bool]:
     }
 
 
+def _enforce_plan_quota(settings: Settings, company, resource: str) -> None:
+    """Raise 402 if `company` is over its plan's calendar-month cap for
+    `resource` (see `plans.py`). No-op when the plan is unlimited for that
+    resource (the default) or the company row is missing."""
+    if company is None:
+        return
+    plan = company["subscription_plan"]
+    limit = plans.monthly_limit(plan, resource)
+    if limit is None:
+        return
+    summary = usage.get_monthly_summary(settings, company["id"])
+    used = summary["research_calls"] if resource == "research" else summary["content_runs"]
+    if used >= limit:
+        raise HTTPException(
+            status_code=402,
+            detail=(
+                f"The {plan} plan includes {limit} {resource.replace('_', ' ')} per month "
+                f"and {used} have been used. Upgrade at /billing/plans to continue."
+            ),
+        )
+
+
 @app.post("/research", response_model=ResearchReport)
 def research(
     request: ResearchRequest, current: auth.CurrentUser = Depends(auth.get_current_user)
 ) -> ResearchReport:
     settings = get_settings()
     company = db.get_company_by_id(settings.database_path, current.company_id)
-    content_model = company["content_model"] if company is not None else None
+    _enforce_plan_quota(settings, company, "research")
+    company_default_model = company["content_model"] if company is not None else None
+    content_model = request.model or company_default_model
     language = company["content_language"] if company is not None else None
     report = ResearchOrchestrator().run(request, content_model=content_model, language=language)
     db.insert_research_report(
@@ -153,6 +202,33 @@ def research_detail(
     if row is None:
         raise HTTPException(status_code=404, detail="No research report with that id.")
     return json.loads(row["report_json"])
+
+
+def _export_response(kind: str, data: dict[str, Any], fmt: str, filename_stem: str) -> Response:
+    if fmt not in exports.FORMATS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"format must be one of {', '.join(exports.FORMATS)}.",
+        )
+    body = exports.render(kind, data, fmt)  # type: ignore[arg-type]
+    return Response(
+        content=body,
+        media_type=exports.MEDIA_TYPES[fmt],  # type: ignore[index]
+        headers={"Content-Disposition": f'attachment; filename="{filename_stem}.{fmt}"'},
+    )
+
+
+@app.get("/research/{report_id}/export")
+def research_export(
+    report_id: int,
+    format: str = "md",
+    current: auth.CurrentUser = Depends(auth.get_current_user),
+) -> Response:
+    settings = get_settings()
+    row = db.get_research_report(settings.database_path, current.company_id, report_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail="No research report with that id.")
+    return _export_response("research", json.loads(row["report_json"]), format, f"research-{report_id}")
 
 
 @app.get("/daily-content/dates")
@@ -188,16 +264,27 @@ def daily_content_detail(
     return _with_review_status(data, settings, current.company_id, date)
 
 
-def _company_content_kwargs(company) -> dict[str, Any]:
+def _validated_model(model: str | None) -> str | None:
+    """Query-param equivalent of the request bodies' `model` field
+    validator - 400s on an unknown content model instead of pydantic's
+    422."""
+    try:
+        return model_catalog.validate_content_model(model)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+def _company_content_kwargs(company, *, model_override: str | None = None) -> dict[str, Any]:
     """Extracts the per-company content-generation overrides
     (`DailyContentOrchestrator.run()`/`run_custom_topic()` keyword args) from
     a `companies` row - shared by the daily-content, custom-content, and
-    scheduler call sites so they stay in sync."""
+    scheduler call sites so they stay in sync. `model_override` (a validated
+    per-request content model) wins over the company's stored default."""
     if company is None:
-        return {}
+        return {"content_model": model_override} if model_override else {}
     return {
         "brand_voice": company["brand_voice"],
-        "content_model": company["content_model"],
+        "content_model": model_override or company["content_model"],
         "language": company["content_language"],
         "target_duration_seconds": company["target_duration_seconds"],
         "image_size": company["image_size"],
@@ -206,11 +293,17 @@ def _company_content_kwargs(company) -> dict[str, Any]:
 
 
 @app.post("/daily-content/run")
-def daily_content_run(current: auth.CurrentUser = Depends(auth.get_current_user)) -> dict[str, Any]:
+def daily_content_run(
+    model: str | None = None,
+    current: auth.CurrentUser = Depends(auth.get_current_user),
+) -> dict[str, Any]:
     settings = get_settings()
     company = db.get_company_by_id(settings.database_path, current.company_id)
+    _enforce_plan_quota(settings, company, "content_runs")
+    model_override = _validated_model(model)
     report = DailyContentOrchestrator(settings).run(
-        company_slug=current.company_slug, **_company_content_kwargs(company)
+        company_slug=current.company_slug,
+        **_company_content_kwargs(company, model_override=model_override),
     )
     usage.record_daily_content_run(settings, current.company_id, len(report.bundles))
     data = report.model_dump(mode="json")
@@ -230,13 +323,102 @@ def custom_content_run(
 ) -> dict[str, Any]:
     settings = get_settings()
     company = db.get_company_by_id(settings.database_path, current.company_id)
+    _enforce_plan_quota(settings, company, "content_runs")
     report = DailyContentOrchestrator(settings).run_custom_topic(
-        body.topic, company_slug=current.company_slug, **_company_content_kwargs(company)
+        body.topic,
+        company_slug=current.company_slug,
+        **_company_content_kwargs(company, model_override=body.model),
     )
     usage.record_daily_content_run(settings, current.company_id, len(report.bundles))
     data = report.model_dump(mode="json")
     data = _with_media_urls(data, current.company_slug)
     return _with_review_status(data, settings, current.company_id, report.date)
+
+
+@app.post("/custom-content/bulk")
+def custom_content_bulk(
+    body: BulkCustomContentRequest, current: auth.CurrentUser = Depends(auth.get_current_user)
+) -> dict[str, Any]:
+    """Run a list of custom topics in one request. Each topic is metered
+    and quota-checked individually: once the plan's monthly content limit
+    is reached the rest are returned as `skipped` instead of aborting the
+    batch."""
+    settings = get_settings()
+    orchestrator = DailyContentOrchestrator(settings)
+    results: list[dict[str, Any]] = []
+    for topic in body.topics:
+        company = db.get_company_by_id(settings.database_path, current.company_id)
+        try:
+            _enforce_plan_quota(settings, company, "content_runs")
+        except HTTPException as exc:
+            if exc.status_code != 402:
+                raise
+            results.append({"topic": topic, "status": "skipped", "detail": exc.detail})
+            continue
+        report = orchestrator.run_custom_topic(
+            topic,
+            company_slug=current.company_slug,
+            **_company_content_kwargs(company, model_override=body.model),
+        )
+        usage.record_daily_content_run(settings, current.company_id, len(report.bundles))
+        results.append(
+            {
+                "topic": topic,
+                "status": "generated",
+                "run_id": report.date,
+                "bundle_count": len(report.bundles),
+            }
+        )
+    return {
+        "requested": len(body.topics),
+        "generated": sum(1 for r in results if r["status"] == "generated"),
+        "skipped": sum(1 for r in results if r["status"] == "skipped"),
+        "results": results,
+    }
+
+
+@app.post("/custom-content/compare")
+def custom_content_compare(
+    body: MultiModelContentRequest, current: auth.CurrentUser = Depends(auth.get_current_user)
+) -> dict[str, Any]:
+    """Generate one topic with several models at once and return every run
+    side by side, so a reviewer can keep the best. Each model is a full
+    pipeline, metered and quota-checked individually (like `/bulk`): models
+    that hit the monthly content limit come back as `skipped`."""
+    settings = get_settings()
+    orchestrator = DailyContentOrchestrator(settings)
+    results: list[dict[str, Any]] = []
+    for model in body.models:
+        company = db.get_company_by_id(settings.database_path, current.company_id)
+        try:
+            _enforce_plan_quota(settings, company, "content_runs")
+        except HTTPException as exc:
+            if exc.status_code != 402:
+                raise
+            results.append({"model": model, "status": "skipped", "detail": exc.detail})
+            continue
+        report = orchestrator.run_custom_topic(
+            body.topic,
+            company_slug=current.company_slug,
+            **_company_content_kwargs(company, model_override=model),
+        )
+        usage.record_daily_content_run(settings, current.company_id, len(report.bundles))
+        results.append(
+            {
+                "model": model,
+                "label": model_catalog.CONTENT_MODEL_CHOICES.get(model, model),
+                "status": "generated",
+                "run_id": report.date,
+                "bundle_count": len(report.bundles),
+            }
+        )
+    return {
+        "topic": body.topic,
+        "requested": len(body.models),
+        "generated": sum(1 for r in results if r["status"] == "generated"),
+        "skipped": sum(1 for r in results if r["status"] == "skipped"),
+        "results": results,
+    }
 
 
 @app.get("/custom-content/history")
@@ -336,6 +518,27 @@ def library(current: auth.CurrentUser = Depends(auth.get_current_user)) -> list[
 
     items.sort(key=lambda item: item["created_at"], reverse=True)
     return items
+
+
+@app.get("/library/{run_id}/export")
+def library_export(
+    run_id: str,
+    format: str = "md",
+    current: auth.CurrentUser = Depends(auth.get_current_user),
+) -> Response:
+    """Download a daily (`YYYY-MM-DD`) or custom (`custom-...`) content run
+    as Markdown/JSON/CSV. Same tenant-scoped manifest lookup as
+    `/daily-content/{date}` and `/custom-content/{run_id}`, then the social
+    posts are collapsed to the picked A/B variant per platform."""
+    if not (_DATE_RE.match(run_id) or run_id.startswith("custom-")):
+        raise HTTPException(status_code=400, detail="run_id must be YYYY-MM-DD or custom-*.")
+    settings = get_settings()
+    manifest = tenant_output_dir(settings, current.company_slug, run_id) / "manifest.json"
+    if not manifest.is_file():
+        raise HTTPException(status_code=404, detail="No content run with that id.")
+    data = json.loads(manifest.read_text(encoding="utf-8"))
+    data = _with_review_status(data, settings, current.company_id, run_id)
+    return _export_response("content", data, format, f"content-{run_id}")
 
 
 @app.get("/onboarding/status")
@@ -789,6 +992,7 @@ def home() -> str:
     <button class="tab-btn" type="button" data-tab="daily-content">Daily Content</button>
     <button class="tab-btn" type="button" data-tab="custom-content">Custom Content</button>
     <button class="tab-btn" type="button" data-tab="library">Library</button>
+    <button class="tab-btn" type="button" data-tab="calendar">Calendar</button>
   </div>
 
   <div id="researchView">
@@ -976,6 +1180,43 @@ def home() -> str:
       <p class="status-text" style="margin:8px 0 0">The logo is automatically overlaid on generated cover/slide images (not on placeholders).</p>
     </div>
 
+    <div class="card input-card" id="billingCard" style="display:none">
+      <div class="section-title" style="margin:0 0 8px">Billing</div>
+      <div class="item-head" style="margin-bottom:10px">
+        <div>
+          <span class="pill pill-approved" id="billingPlanPill">Free</span>
+          <span class="status-text" id="billingStatusText" style="margin-left:8px"></span>
+        </div>
+        <button class="btn-secondary" id="billingPortalBtn" type="button" style="display:none">Manage billing</button>
+      </div>
+      <div id="billingPlans" class="stack"></div>
+      <p class="status-text" id="billingHint" style="margin:8px 0 0"></p>
+    </div>
+
+    <div class="card input-card" id="webhooksCard" style="display:none">
+      <div class="section-title" style="margin:0 0 8px">Webhooks</div>
+      <p class="status-text" style="margin:0 0 10px">Get an HTTP callback when content is submitted, approved, rejected or published. Each delivery is signed with <code>X-AI-Signature</code>.</p>
+      <div class="row">
+        <input type="url" id="webhookUrl" placeholder="https://your-app.example.com/hooks/ai" style="flex:1; min-width:220px" />
+        <button class="btn-secondary" id="webhookAddBtn" type="button">Add endpoint</button>
+        <span class="status-text" id="webhookStatus"></span>
+      </div>
+      <div id="webhookSecretBox" style="display:none; margin-top:10px"></div>
+      <div id="webhookList" class="stack" style="margin-top:12px"></div>
+    </div>
+
+    <div class="card input-card" id="apiKeysCard" style="display:none">
+      <div class="section-title" style="margin:0 0 8px">API keys</div>
+      <p class="status-text" style="margin:0 0 10px">Drive the product from your own scripts: <code>Authorization: Bearer &lt;key&gt;</code>. Keys can run and review content but cannot change billing, team, webhooks or keys.</p>
+      <div class="row">
+        <input type="text" id="apiKeyName" placeholder="What is this key for? e.g. CI pipeline" style="flex:1; min-width:220px" />
+        <button class="btn-secondary" id="apiKeyAddBtn" type="button">Create key</button>
+        <span class="status-text" id="apiKeyStatus"></span>
+      </div>
+      <div id="apiKeyRevealBox" style="display:none; margin-top:10px"></div>
+      <div id="apiKeyList" class="stack" style="margin-top:12px"></div>
+    </div>
+
     <div id="dcErrorBox"></div>
 
     <div id="dcResults"></div>
@@ -994,8 +1235,24 @@ def home() -> str:
           <span class="spinner" id="ccSpinner"></span>
           <span id="ccRunLabel">Generate content</span>
         </button>
+        <select id="ccModelSelect"><option value="">Default model</option></select>
         <select id="ccHistorySelect"><option value="">No past runs yet</option></select>
         <span class="status-text" id="ccStatus"></span>
+      </div>
+      <div class="row" style="margin-top:10px">
+        <button class="btn-secondary" id="ccCompareToggle" type="button">Compare models…</button>
+      </div>
+      <div id="ccCompareBox" style="display:none; margin-top:12px">
+        <p class="status-text" style="margin:0 0 8px">Pick 2–4 models. Each writes the same topic, then you keep the best one.</p>
+        <div id="ccCompareModels" class="row"></div>
+        <div class="row" style="margin-top:10px">
+          <button class="btn-primary" id="ccCompareBtn" type="button">
+            <span class="spinner" id="ccCompareSpinner"></span>
+            <span id="ccCompareLabel">Generate with selected models</span>
+          </button>
+          <span class="status-text" id="ccCompareStatus"></span>
+        </div>
+        <div id="ccCompareResults" class="stack" style="margin-top:12px"></div>
       </div>
       <p class="status-text" style="margin:8px 0 0">Each run drafts new content for this topic — this can take a minute or two and costs real API usage.</p>
     </div>
@@ -1003,6 +1260,29 @@ def home() -> str:
     <div id="ccErrorBox"></div>
 
     <div id="ccResults"></div>
+  </div>
+
+  <div id="calendarView" style="display:none">
+    <div class="hero">
+      <h1>What goes out, and when.</h1>
+      <p>Approved content queued to publish later. Approval is re-checked at send time — content rejected in the meantime is never posted.</p>
+    </div>
+
+    <div class="card input-card">
+      <div class="row">
+        <select id="calStatusFilter">
+          <option value="">All</option>
+          <option value="pending">Pending</option>
+          <option value="published">Published</option>
+          <option value="failed">Failed</option>
+          <option value="canceled">Canceled</option>
+        </select>
+        <span class="status-text" id="calPlatformNote"></span>
+      </div>
+    </div>
+
+    <div id="calErrorBox"></div>
+    <div id="calResults"></div>
   </div>
 
   <div id="libraryView" style="display:none">
@@ -1167,6 +1447,9 @@ async function checkAuth(){
     loadTeam();
     loadAssetsCard();
     loadOnboarding();
+    loadBillingCard();
+    loadWebhooksCard();
+    loadApiKeysCard();
   }
 }
 
@@ -1327,14 +1610,19 @@ function switchTab(tab){
   document.getElementById('dailyContentView').style.display = tab === 'daily-content' ? '' : 'none';
   document.getElementById('customContentView').style.display = tab === 'custom-content' ? '' : 'none';
   document.getElementById('libraryView').style.display = tab === 'library' ? '' : 'none';
+  document.getElementById('calendarView').style.display = tab === 'calendar' ? '' : 'none';
   if (tab === 'daily-content' && !dcDatesLoaded){
     loadDailyContentDates();
   }
   if (tab === 'custom-content' && !ccHistoryLoaded){
     loadCustomContentHistory();
+    initCustomContentModels();
   }
   if (tab === 'library' && !libraryLoaded){
     loadLibrary();
+  }
+  if (tab === 'calendar'){
+    loadCalendar();
   }
 }
 
@@ -1691,6 +1979,292 @@ async function deleteAsset(id){
   }
 }
 
+async function loadBillingCard(){
+  const card = document.getElementById('billingCard');
+  if (!currentUser || currentUser.role !== 'owner'){ card.style.display = 'none'; return; }
+  card.style.display = '';
+  const pill = document.getElementById('billingPlanPill');
+  const statusText = document.getElementById('billingStatusText');
+  const portalBtn = document.getElementById('billingPortalBtn');
+  const hint = document.getElementById('billingHint');
+  try{
+    const [statusRes, plansRes] = await Promise.all([fetch('/billing/status'), fetch('/billing/plans')]);
+    const status = await statusRes.json();
+    const plans = await plansRes.json();
+
+    pill.textContent = status.plan.charAt(0).toUpperCase() + status.plan.slice(1);
+    statusText.textContent = status.status !== 'active' ? '(' + status.status + ')' : '';
+    portalBtn.style.display = status.manageable ? '' : 'none';
+
+    if (!plans.length){
+      document.getElementById('billingPlans').innerHTML = '';
+      hint.textContent = 'Billing is not configured yet - set STRIPE_SECRET_KEY and price ids to enable upgrades.';
+      return;
+    }
+    hint.textContent = '';
+    document.getElementById('billingPlans').innerHTML = plans.map(p =>
+      '<div class="item-card" style="display:flex; align-items:center; justify-content:space-between">' +
+        '<div><div class="item-title">' + esc(p.name) + '</div><div class="item-meta">' + esc(p.price_display) + '</div></div>' +
+        (status.plan === p.id
+          ? '<span class="pill pill-approved">Current plan</span>'
+          : '<button class="btn-secondary" type="button" onclick="startCheckout(\\'' + p.id + '\\')">Upgrade</button>') +
+      '</div>'
+    ).join('');
+  }catch(e){
+    hint.textContent = 'Could not load billing.';
+  }
+}
+
+async function startCheckout(plan){
+  try{
+    const r = await fetch('/billing/checkout', {
+      method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({plan})
+    });
+    if (!r.ok){
+      let detail = 'Request failed (' + r.status + ').';
+      try { const errData = await r.json(); if (errData.detail) detail = JSON.stringify(errData.detail); } catch(e){}
+      throw new Error(detail);
+    }
+    const data = await r.json();
+    window.location.href = data.url;
+  }catch(e){
+    showToast(e.message || String(e), 'error');
+  }
+}
+
+document.getElementById('billingPortalBtn').addEventListener('click', async () => {
+  try{
+    const r = await fetch('/billing/portal', { method:'POST' });
+    if (!r.ok){
+      let detail = 'Request failed (' + r.status + ').';
+      try { const errData = await r.json(); if (errData.detail) detail = JSON.stringify(errData.detail); } catch(e){}
+      throw new Error(detail);
+    }
+    const data = await r.json();
+    window.location.href = data.url;
+  }catch(e){
+    showToast(e.message || String(e), 'error');
+  }
+});
+
+async function loadWebhooksCard(){
+  const card = document.getElementById('webhooksCard');
+  if (!currentUser || currentUser.role !== 'owner'){ card.style.display = 'none'; return; }
+  card.style.display = '';
+  const list = document.getElementById('webhookList');
+  try{
+    const r = await fetch('/webhooks');
+    if (!r.ok) throw new Error('Request failed (' + r.status + ').');
+    const data = await r.json();
+    if (!data.webhooks.length){
+      list.innerHTML = '<div class="empty-state">No endpoints yet.</div>';
+      return;
+    }
+    list.innerHTML = data.webhooks.map(hook =>
+      '<div class="item-card" style="display:flex; align-items:center; justify-content:space-between; gap:12px">' +
+        '<div style="min-width:0">' +
+          '<div class="item-title" style="overflow-wrap:anywhere">' + esc(hook.url) + '</div>' +
+          '<div class="item-meta">' + esc(hook.event_types === 'all' ? 'All events' : hook.event_types.split(',').join(', ')) + '</div>' +
+        '</div>' +
+        '<button class="btn-secondary" type="button" onclick="deleteWebhook(' + hook.id + ')">Remove</button>' +
+      '</div>'
+    ).join('');
+  }catch(e){
+    list.innerHTML = '<div class="error-card">Could not load webhooks.</div>';
+  }
+}
+
+async function addWebhook(){
+  const input = document.getElementById('webhookUrl');
+  const status = document.getElementById('webhookStatus');
+  const secretBox = document.getElementById('webhookSecretBox');
+  const url = input.value.trim();
+  if (!url){ status.textContent = 'Enter a URL.'; return; }
+
+  status.textContent = 'Adding…';
+  secretBox.style.display = 'none';
+  try{
+    const r = await fetch('/webhooks', {
+      method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({url})
+    });
+    if (!r.ok){
+      let detail = 'Request failed (' + r.status + ').';
+      try { const errData = await r.json(); if (errData.detail) detail = JSON.stringify(errData.detail); } catch(e){}
+      throw new Error(detail);
+    }
+    const hook = await r.json();
+    input.value = '';
+    status.textContent = '';
+    // The signing secret is only ever returned on creation - show it once,
+    // prominently, because it cannot be retrieved again.
+    secretBox.style.display = '';
+    secretBox.innerHTML = '<div class="item-card">' +
+      '<div class="item-title">Signing secret — copy it now</div>' +
+      '<div class="item-meta" style="margin:6px 0; overflow-wrap:anywhere"><code>' + esc(hook.secret) + '</code></div>' +
+      '<div class="item-meta">This is the only time it is shown.</div>' +
+    '</div>';
+    loadWebhooksCard();
+  }catch(e){
+    // Keep the reason on screen, not just in a toast - a rejected webhook URL
+    // (unresolvable host, private address) needs to be readable to act on.
+    status.textContent = e.message || String(e);
+    showToast(e.message || String(e), 'error');
+  }
+}
+
+async function deleteWebhook(id){
+  try{
+    const r = await fetch('/webhooks/' + id, { method:'DELETE' });
+    if (!r.ok) throw new Error('Request failed (' + r.status + ').');
+    loadWebhooksCard();
+  }catch(e){
+    showToast(e.message || String(e), 'error');
+  }
+}
+
+document.getElementById('webhookAddBtn').addEventListener('click', addWebhook);
+
+let calendarLoaded = false;
+
+const SCHEDULE_STATUS_PILL = {
+  pending: 'pill-pending_review', published: 'pill-approved',
+  failed: 'pill-rejected', canceled: 'pill-draft'
+};
+
+async function loadCalendar(){
+  const results = document.getElementById('calResults');
+  const errorBox = document.getElementById('calErrorBox');
+  const filter = document.getElementById('calStatusFilter').value;
+  errorBox.innerHTML = '';
+  try{
+    const url = '/schedule' + (filter ? '?status=' + encodeURIComponent(filter) : '');
+    const [rowsRes, platformsRes] = await Promise.all([fetch(url), fetch('/schedule/platforms')]);
+    if (!rowsRes.ok) throw new Error('Request failed (' + rowsRes.status + ').');
+    const rows = await rowsRes.json();
+    calendarLoaded = true;
+
+    if (platformsRes.ok){
+      const p = await platformsRes.json();
+      document.getElementById('calPlatformNote').textContent = p.live.length
+        ? 'Publishing for real to: ' + p.live.join(', ') + '. Others use the stub.'
+        : 'No platform credentials configured — everything publishes through the stub.';
+    }
+
+    if (!rows.length){
+      results.innerHTML = '<div class="empty-state">Nothing scheduled.</div>';
+      return;
+    }
+    results.innerHTML = '<div class="stack">' + rows.map(row => {
+      const when = new Date(row.scheduled_for).toLocaleString();
+      const pillClass = SCHEDULE_STATUS_PILL[row.status] || 'pill-draft';
+      return '<div class="item-card" style="display:flex; align-items:center; justify-content:space-between; gap:12px">' +
+        '<div style="min-width:0">' +
+          '<div class="item-title">' + esc(platformLabel(row.platform)) + ' · ' + esc(when) + '</div>' +
+          '<div class="item-meta">' + esc(row.run_id) + ' · trend ' + row.trend_index +
+            (row.detail ? ' · ' + esc(row.detail) : '') + '</div>' +
+        '</div>' +
+        '<div class="row" style="gap:8px; align-items:center">' +
+          '<span class="pill ' + pillClass + '">' + esc(row.status) + '</span>' +
+          (row.status === 'pending'
+            ? '<button class="btn-secondary" type="button" onclick="cancelScheduled(' + row.id + ')">Cancel</button>'
+            : '') +
+        '</div>' +
+      '</div>';
+    }).join('') + '</div>';
+  }catch(e){
+    errorBox.innerHTML = '<div class="error-card">' + esc(e.message || String(e)) + '</div>';
+  }
+}
+
+async function cancelScheduled(id){
+  try{
+    const r = await fetch('/schedule/' + id, { method:'DELETE' });
+    if (!r.ok) throw new Error('Request failed (' + r.status + ').');
+    loadCalendar();
+  }catch(e){
+    showToast(e.message || String(e), 'error');
+  }
+}
+
+document.getElementById('calStatusFilter').addEventListener('change', loadCalendar);
+
+async function loadApiKeysCard(){
+  const card = document.getElementById('apiKeysCard');
+  if (!currentUser || currentUser.role !== 'owner'){ card.style.display = 'none'; return; }
+  card.style.display = '';
+  const list = document.getElementById('apiKeyList');
+  try{
+    const r = await fetch('/api-keys');
+    if (!r.ok) throw new Error('Request failed (' + r.status + ').');
+    const data = await r.json();
+    if (!data.keys.length){
+      list.innerHTML = '<div class="empty-state">No keys yet.</div>';
+      return;
+    }
+    list.innerHTML = data.keys.map(key => {
+      const used = key.last_used_at ? 'last used ' + new Date(key.last_used_at).toLocaleString() : 'never used';
+      return '<div class="item-card" style="display:flex; align-items:center; justify-content:space-between; gap:12px">' +
+        '<div style="min-width:0">' +
+          '<div class="item-title"' + (key.revoked ? ' style="text-decoration:line-through"' : '') + '>' + esc(key.name) + '</div>' +
+          '<div class="item-meta"><code>' + esc(key.prefix) + '…</code> · ' + esc(used) + '</div>' +
+        '</div>' +
+        (key.revoked
+          ? '<span class="pill pill-rejected">Revoked</span>'
+          : '<button class="btn-secondary" type="button" onclick="revokeApiKey(' + key.id + ')">Revoke</button>') +
+      '</div>';
+    }).join('');
+  }catch(e){
+    list.innerHTML = '<div class="error-card">Could not load API keys.</div>';
+  }
+}
+
+async function createApiKey(){
+  const input = document.getElementById('apiKeyName');
+  const status = document.getElementById('apiKeyStatus');
+  const reveal = document.getElementById('apiKeyRevealBox');
+  const name = input.value.trim();
+  if (!name){ status.textContent = 'Give the key a name.'; return; }
+
+  status.textContent = 'Creating…';
+  reveal.style.display = 'none';
+  try{
+    const r = await fetch('/api-keys', {
+      method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({name})
+    });
+    if (!r.ok){
+      let detail = 'Request failed (' + r.status + ').';
+      try { const errData = await r.json(); if (errData.detail) detail = JSON.stringify(errData.detail); } catch(e){}
+      throw new Error(detail);
+    }
+    const key = await r.json();
+    input.value = '';
+    status.textContent = '';
+    // Shown once and never retrievable again - make that unmissable.
+    reveal.style.display = '';
+    reveal.innerHTML = '<div class="item-card">' +
+      '<div class="item-title">Copy this key now</div>' +
+      '<div class="item-meta" style="margin:6px 0; overflow-wrap:anywhere"><code>' + esc(key.key) + '</code></div>' +
+      '<div class="item-meta">It is not stored and cannot be shown again.</div>' +
+    '</div>';
+    loadApiKeysCard();
+  }catch(e){
+    status.textContent = e.message || String(e);
+    showToast(e.message || String(e), 'error');
+  }
+}
+
+async function revokeApiKey(id){
+  try{
+    const r = await fetch('/api-keys/' + id, { method:'DELETE' });
+    if (!r.ok) throw new Error('Request failed (' + r.status + ').');
+    loadApiKeysCard();
+  }catch(e){
+    showToast(e.message || String(e), 'error');
+  }
+}
+
+document.getElementById('apiKeyAddBtn').addEventListener('click', createApiKey);
+
 const ONBOARDING_STEP_TARGETS = {
   brand_voice: 'brandVoiceCard', content_model: 'contentModelCard', logo: 'assetsCard',
   first_run: 'dcRunBtn', team: 'teamCard'
@@ -1743,7 +2317,7 @@ const REVIEW_TRANSITIONS = {
   draft: [{action:'submit-for-review', label:'Submit for review'}],
   pending_review: [{action:'approve', label:'Approve'}, {action:'reject', label:'Reject'}],
   rejected: [{action:'submit-for-review', label:'Resubmit for review'}],
-  approved: [{action:'publish', label:'Publish (stub)'}]
+  approved: [{action:'publish', label:'Publish now'}]
 };
 const REVIEW_STATUS_LABEL = {draft:'Draft', pending_review:'Pending review', approved:'Approved', rejected:'Rejected'};
 const REVIEW_ACTION_RESULT_STATUS = {
@@ -1777,7 +2351,66 @@ function reviewControls(context, date, trendIndex, bundleStatus){
   const buttons = (REVIEW_TRANSITIONS[s] || []).map(t =>
     '<button class="btn-secondary" type="button" onclick="reviewAction(\\'' + context + '\\', \\'' + date + '\\', ' + trendIndex + ', \\'' + t.action + '\\', this)">' + esc(t.label) + '</button>'
   ).join('');
-  return '<div class="review-row">' + pill + buttons + '</div>';
+  // Only approved content can be queued - mirrors the server-side gate, so
+  // the button never appears for a state the API would reject.
+  const scheduler = s === 'approved' ? scheduleControls(context, date, trendIndex) : '';
+  return '<div class="review-row">' + pill + buttons + scheduler + '</div>';
+}
+
+function scheduleSlotId(date, trendIndex){
+  return 'sched-' + date.replace(/[^a-zA-Z0-9]/g, '') + '-' + trendIndex;
+}
+
+function scheduleControls(context, date, trendIndex){
+  const id = scheduleSlotId(date, trendIndex);
+  return '<button class="btn-secondary" type="button" onclick="toggleScheduleBox(\\'' + id + '\\')">Schedule…</button>' +
+    '<span id="' + id + '" style="display:none; gap:6px; align-items:center" class="row">' +
+      '<input type="datetime-local" id="' + id + '-when" />' +
+      '<button class="btn-secondary" type="button" onclick="submitSchedule(\\'' + context + '\\', \\'' + date + '\\', ' + trendIndex + ', \\'' + id + '\\', this)">Queue</button>' +
+    '</span>';
+}
+
+function toggleScheduleBox(id){
+  const box = document.getElementById(id);
+  box.style.display = box.style.display === 'none' ? 'inline-flex' : 'none';
+  if (box.style.display !== 'none'){
+    const input = document.getElementById(id + '-when');
+    if (!input.value){
+      // Default to an hour out, in the viewer's own timezone.
+      const when = new Date(Date.now() + 60 * 60 * 1000);
+      when.setMinutes(when.getMinutes() - when.getTimezoneOffset());
+      input.value = when.toISOString().slice(0, 16);
+    }
+  }
+}
+
+async function submitSchedule(context, date, trendIndex, id, btn){
+  const raw = document.getElementById(id + '-when').value;
+  if (!raw){ showToast('Pick a date and time.', 'error'); return; }
+  btn.disabled = true;
+  try{
+    // datetime-local has no zone; interpret it as local time and send an
+    // absolute instant so the server never has to guess.
+    const iso = new Date(raw).toISOString();
+    const r = await fetch('/daily-content/' + date + '/trend/' + trendIndex + '/schedule', {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({scheduled_for: iso})
+    });
+    if (!r.ok){
+      let detail = 'Request failed (' + r.status + ').';
+      try { const errData = await r.json(); if (errData.detail) detail = JSON.stringify(errData.detail); } catch(e){}
+      throw new Error(detail);
+    }
+    const data = await r.json();
+    const queued = data.queued.length;
+    showToast(queued ? ('Queued ' + queued + ' post' + (queued === 1 ? '' : 's') + '.') : 'Already queued.');
+    document.getElementById(id).style.display = 'none';
+    if (calendarLoaded) loadCalendar();
+  }catch(e){
+    showToast(e.message || String(e), 'error');
+  }finally{
+    btn.disabled = false;
+  }
 }
 
 const PLATFORM_COLOR = {
@@ -2051,6 +2684,96 @@ async function loadCustomContentRun(runId){
 
 document.getElementById('ccHistorySelect').addEventListener('change', (e) => loadCustomContentRun(e.target.value));
 
+let ccModelChoices = null;
+
+async function loadContentModelChoices(){
+  if (ccModelChoices) return ccModelChoices;
+  try{
+    const r = await fetch('/auth/content-model-choices');
+    ccModelChoices = r.ok ? await r.json() : {};
+  }catch(e){ ccModelChoices = {}; }
+  return ccModelChoices;
+}
+
+async function initCustomContentModels(){
+  const choices = await loadContentModelChoices();
+  const ids = Object.keys(choices);
+
+  const select = document.getElementById('ccModelSelect');
+  select.innerHTML = '<option value="">Default model</option>' +
+    ids.map(id => '<option value="' + esc(id) + '">' + esc(choices[id]) + '</option>').join('');
+
+  document.getElementById('ccCompareModels').innerHTML = ids.map(id =>
+    '<label class="chip" style="cursor:pointer">' +
+      '<input type="checkbox" class="cc-compare-model" value="' + esc(id) + '" style="margin-right:6px" />' +
+      esc(choices[id]) +
+    '</label>'
+  ).join('');
+}
+
+document.getElementById('ccCompareToggle').addEventListener('click', async () => {
+  const box = document.getElementById('ccCompareBox');
+  const opening = box.style.display === 'none';
+  box.style.display = opening ? '' : 'none';
+  document.getElementById('ccCompareToggle').textContent = opening ? 'Hide comparison' : 'Compare models…';
+});
+
+function selectedCompareModels(){
+  return Array.from(document.querySelectorAll('.cc-compare-model:checked')).map(el => el.value);
+}
+
+async function runCompareModels(){
+  const topic = document.getElementById('ccTopic').value.trim();
+  const models = selectedCompareModels();
+  const btn = document.getElementById('ccCompareBtn');
+  const spinner = document.getElementById('ccCompareSpinner');
+  const label = document.getElementById('ccCompareLabel');
+  const status = document.getElementById('ccCompareStatus');
+  const results = document.getElementById('ccCompareResults');
+
+  if (topic.length < 3){ status.textContent = 'Enter a topic first.'; return; }
+  if (models.length < 2){ status.textContent = 'Pick at least two models.'; return; }
+  if (models.length > 4){ status.textContent = 'Pick at most four models.'; return; }
+
+  btn.disabled = true; spinner.classList.add('on'); label.textContent = 'Generating…';
+  status.textContent = models.length + ' models running…';
+  results.innerHTML = '';
+
+  try{
+    const r = await fetch('/custom-content/compare', {
+      method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({topic, models})
+    });
+    if (!r.ok){
+      let detail = 'Request failed (' + r.status + ').';
+      try { const errData = await r.json(); if (errData.detail) detail = JSON.stringify(errData.detail); } catch(e){}
+      throw new Error(detail);
+    }
+    const data = await r.json();
+    status.textContent = data.generated + ' generated' + (data.skipped ? ', ' + data.skipped + ' skipped' : '');
+    results.innerHTML = data.results.map(item =>
+      '<div class="item-card" style="display:flex; align-items:center; justify-content:space-between; gap:12px">' +
+        '<div>' +
+          '<div class="item-title">' + esc(item.label || item.model) + '</div>' +
+          '<div class="item-meta">' + (item.status === 'generated'
+            ? esc(item.bundle_count + ' bundle' + (item.bundle_count === 1 ? '' : 's'))
+            : esc(item.detail || 'Skipped')) + '</div>' +
+        '</div>' +
+        (item.status === 'generated'
+          ? '<button class="btn-secondary" type="button" onclick="loadCustomContentRun(\\'' + item.run_id + '\\')">View</button>'
+          : '<span class="pill pill-rejected">Skipped</span>') +
+      '</div>'
+    ).join('');
+    loadCustomContentHistory();
+  }catch(e){
+    status.textContent = '';
+    document.getElementById('ccErrorBox').innerHTML = '<div class="error-card">' + esc(e.message || String(e)) + '</div>';
+  }finally{
+    btn.disabled = false; spinner.classList.remove('on'); label.textContent = 'Generate with selected models';
+  }
+}
+
+document.getElementById('ccCompareBtn').addEventListener('click', runCompareModels);
+
 async function runCustomContent(){
   const topic = document.getElementById('ccTopic').value.trim();
   const btn = document.getElementById('ccRunBtn');
@@ -2069,8 +2792,10 @@ async function runCustomContent(){
   errorBox.innerHTML = '';
 
   try{
+    const model = document.getElementById('ccModelSelect').value;
     const r = await fetch('/custom-content/run', {
-      method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({topic})
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify(model ? {topic, model} : {topic})
     });
     if (!r.ok){
       let detail = 'Request failed (' + r.status + ').';
@@ -2131,8 +2856,24 @@ function renderLibrary(){
       '</div>' +
       '<div class="item-meta">' + esc(when) + '</div>' +
       (item.statuses.length ? '<div style="margin-top:8px">' + libraryStatusPills(item.statuses) + '</div>' : '') +
+      '<div class="row" style="margin-top:10px; gap:6px" onclick="event.stopPropagation()">' +
+        '<span class="status-text" style="margin-right:2px">Export</span>' +
+        libraryExportLinks(item) +
+      '</div>' +
     '</div>';
   }).join('') + '</div>';
+}
+
+function libraryExportLinks(item){
+  // Research reports export through their own route; daily/custom runs share
+  // the library one. Plain links - the endpoints set Content-Disposition, and
+  // the session cookie rides along on a same-origin navigation.
+  const base = item.type === 'research'
+    ? '/research/' + encodeURIComponent(item.id) + '/export'
+    : '/library/' + encodeURIComponent(item.id) + '/export';
+  return ['md', 'json', 'csv'].map(fmt =>
+    '<a class="chip" href="' + base + '?format=' + fmt + '" download>' + fmt.toUpperCase() + '</a>'
+  ).join('');
 }
 
 async function loadLibrary(){

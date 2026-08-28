@@ -1,17 +1,23 @@
 from __future__ import annotations
 
 import json
+from datetime import UTC, datetime
 from typing import Literal
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 
-from . import auth, db, review, tenancy
+from . import auth, db, publishing, review, tenancy, webhooks
 from .config import Settings, get_settings
 from .content_models import ContentBundle, ContentStatus
-from .publishers import get_publisher
 
 router = APIRouter(prefix="/daily-content", tags=["review"])
+
+_EVENT_BY_STATUS = {
+    ContentStatus.pending_review: "content.submitted_for_review",
+    ContentStatus.approved: "content.approved",
+    ContentStatus.rejected: "content.rejected",
+}
 
 
 class ReviewActionRequest(BaseModel):
@@ -19,6 +25,11 @@ class ReviewActionRequest(BaseModel):
 
 
 class PublishRequest(BaseModel):
+    platforms: list[str] | None = None
+
+
+class ScheduleRequest(BaseModel):
+    scheduled_for: datetime
     platforms: list[str] | None = None
 
 
@@ -57,6 +68,19 @@ def _transition(
         )
     except review.InvalidTransition as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
+    event = _EVENT_BY_STATUS.get(new_status)
+    if event:
+        webhooks.deliver(
+            settings,
+            current.company_id,
+            event,
+            {
+                "date": date,
+                "trend_index": trend_index,
+                "status": new_status.value,
+                "reviewer_email": current.email,
+            },
+        )
     return status.model_dump(mode="json")
 
 
@@ -126,42 +150,72 @@ def publish(
     current: auth.CurrentUser = Depends(auth.get_current_user),
     settings: Settings = Depends(get_settings),
 ) -> dict:
+    try:
+        results = publishing.publish_bundle_platforms(
+            settings,
+            company_id=current.company_id,
+            company_slug=current.company_slug,
+            date=date,
+            trend_index=trend_index,
+            platforms=body.platforms,
+        )
+    except publishing.NotApproved as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+    except publishing.BundleNotFound as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    return {"results": [r.model_dump() for r in results]}
+
+
+@router.post("/{date}/trend/{trend_index}/schedule")
+def schedule(
+    date: str,
+    trend_index: int,
+    body: ScheduleRequest,
+    current: auth.CurrentUser = Depends(auth.get_current_user),
+    settings: Settings = Depends(get_settings),
+) -> dict:
+    """Queues an approved bundle to publish later. The approval gate is
+    checked twice on purpose: here, so a mistake surfaces while the user is
+    still looking at it, and again at send time in `publishing.py`, because
+    a bundle can be rejected in between."""
+    when = body.scheduled_for
+    if when.tzinfo is None:
+        when = when.replace(tzinfo=UTC)
+    if when <= datetime.now(UTC):
+        raise HTTPException(status_code=400, detail="scheduled_for must be in the future.")
+
+    bundle = _load_bundle(settings, current.company_slug, date, trend_index)
     status = review.get_status(
         settings, company_id=current.company_id, date=date, trend_index=trend_index
     )
     if status.status != ContentStatus.approved:
-        raise HTTPException(status_code=403, detail="Bundle must be approved before publishing.")
+        raise HTTPException(status_code=403, detail="Bundle must be approved before scheduling.")
 
-    bundle = _load_bundle(settings, current.company_slug, date, trend_index)
-    publisher = get_publisher("stub")
-    selected_variants = db.get_selected_variants(
-        settings.database_path, current.company_id, date, trend_index
-    )
-    # Resolve each platform to its one selected post (default variant "A"
-    # when nothing was explicitly picked) - `bundle.social_posts` normally
-    # has two entries per platform (see `SocialPost.variant`), and a
-    # publisher must only ever see the one the company chose to publish.
-    resolved_posts = {}
-    for post in bundle.social_posts:
-        if post.variant is None or post.variant == selected_variants.get(post.platform, "A"):
-            resolved_posts[post.platform] = post
-    bundle_for_publish = bundle.model_copy(update={"social_posts": list(resolved_posts.values())})
+    known = {post.platform for post in bundle.social_posts}
+    platforms = body.platforms or sorted(known)
+    unknown = sorted(set(platforms) - known)
+    if unknown:
+        raise HTTPException(
+            status_code=400, detail=f"Unknown platform(s) for this bundle: {', '.join(unknown)}."
+        )
 
-    platforms = body.platforms or list(resolved_posts.keys())
-
-    results = [publisher.publish(bundle_for_publish, platform) for platform in platforms]
-    for result in results:
-        db.insert_publish_log(
+    queued, duplicates = [], []
+    for platform in platforms:
+        post_id = db.schedule_post(
             settings.database_path,
             company_id=current.company_id,
             date=date,
             trend_index=trend_index,
-            platform=result.platform,
-            success=result.success,
-            external_id=result.external_id,
-            detail=result.detail,
+            platform=platform,
+            scheduled_for=when.isoformat(),
         )
-    return {"results": [r.model_dump() for r in results]}
+        (queued if post_id is not None else duplicates).append(platform)
+
+    return {
+        "scheduled_for": when.isoformat(),
+        "queued": queued,
+        "already_queued": duplicates,
+    }
 
 
 __all__ = ["router"]

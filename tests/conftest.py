@@ -26,6 +26,17 @@ def client(tmp_path, monkeypatch):
 
 
 @pytest.fixture
+def api_client(client):
+    """A second client against the same app/DB that carries no session
+    cookie - the only way to prove an API key authenticates on its own
+    rather than riding on `client`'s cookie. Depends on `client` so the env
+    is already patched and `lifespan` has already initialized the DB; it is
+    deliberately not entered as a context manager so a second scheduler
+    task is not started."""
+    return TestClient(app)
+
+
+@pytest.fixture
 def signup():
     """Returns a `signup(client, ...)` helper - a fixture (not a plain
     importable function) so tests don't need `tests` to be an importable

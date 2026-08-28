@@ -13,7 +13,7 @@ from datetime import UTC, datetime, timedelta
 
 from fastapi import Depends, HTTPException, Request
 
-from . import db
+from . import api_keys, db
 from .config import Settings, get_settings
 
 
@@ -81,11 +81,48 @@ def _load_current_user(settings: Settings, token: str | None) -> CurrentUser | N
     )
 
 
+def _load_api_key_user(settings: Settings, presented: str) -> CurrentUser | None:
+    """Resolves an `ai_live_...` key to a company-scoped principal. The
+    principal is always `member` (see `api_keys.py`): a key can run and
+    review content, but never reshape the account."""
+    row = db.get_api_key_by_hash(settings.database_path, api_keys.hash_key(presented))
+    if row is None:
+        return None
+    company = db.get_company_by_id(settings.database_path, row["company_id"])
+    if company is None:
+        return None
+    db.touch_api_key(settings.database_path, row["id"])
+    return CurrentUser(
+        user_id=0,
+        company_id=company["id"],
+        company_slug=company["slug"],
+        company_name=company["name"],
+        email=f"api-key:{row['name']}",
+        role="member",
+    )
+
+
+def _bearer_token(request: Request) -> str | None:
+    header = request.headers.get("authorization", "")
+    scheme, _, value = header.partition(" ")
+    return value.strip() if scheme.lower() == "bearer" and value.strip() else None
+
+
 def get_current_user_optional(
     request: Request, settings: Settings = Depends(get_settings)
 ) -> CurrentUser | None:
+    """Session cookie first (the browser app), then an `Authorization:
+    Bearer ai_live_...` API key. Only strings carrying the key prefix are
+    tried as keys, so an unrelated bearer token still falls through to
+    "not authenticated" rather than costing a DB lookup."""
     token = request.cookies.get(settings.session_cookie_name)
-    return _load_current_user(settings, token)
+    user = _load_current_user(settings, token)
+    if user is not None:
+        return user
+    bearer = _bearer_token(request)
+    if bearer and api_keys.looks_like_api_key(bearer):
+        return _load_api_key_user(settings, bearer)
+    return None
 
 
 def get_current_user(

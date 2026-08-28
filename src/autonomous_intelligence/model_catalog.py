@@ -23,4 +23,18 @@ CONTENT_MODEL_CHOICES: dict[str, str] = {
 `gpt-4o-mini`-style pin elsewhere in this app; re-check periodically."""
 """OpenRouter model ID -> human-readable label, in display order."""
 
-__all__ = ["CONTENT_MODEL_CHOICES"]
+
+def validate_content_model(value: str | None) -> str | None:
+    """Normalize a per-company or per-request content-model choice: empty
+    string -> `None` (use the app default), a known key passes through, and
+    anything else raises `ValueError`. Shared by `auth_api.py`'s
+    `/auth/me/content-model` and the per-request `model` fields on the
+    research/content requests so both reject the same set."""
+    if value and value not in CONTENT_MODEL_CHOICES:
+        raise ValueError(
+            f"Unknown content model {value!r}. Choices: {', '.join(CONTENT_MODEL_CHOICES)}."
+        )
+    return value or None
+
+
+__all__ = ["CONTENT_MODEL_CHOICES", "validate_content_model"]

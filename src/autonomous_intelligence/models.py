@@ -1,16 +1,67 @@
 from datetime import UTC, datetime
-from typing import Literal
+from typing import Annotated, Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
+
+from .model_catalog import validate_content_model
+
+_Topic = Annotated[str, Field(min_length=3, max_length=500)]
 
 
-class ResearchRequest(BaseModel):
+class _HasContentModel(BaseModel):
+    """Mixin for request bodies that accept an optional per-request content
+    model (an OpenRouter id from `/auth/content-model-choices`) - overrides
+    the company's default for that one call. Empty/omitted -> company
+    default."""
+
+    model: str | None = Field(default=None)
+
+    @field_validator("model")
+    @classmethod
+    def _check_model(cls, value: str | None) -> str | None:
+        return validate_content_model(value)
+
+
+class ResearchRequest(_HasContentModel):
     query: str = Field(min_length=5, max_length=1000)
     max_iterations: int | None = Field(default=None, ge=1, le=5)
 
 
-class CustomContentRequest(BaseModel):
+class CustomContentRequest(_HasContentModel):
     topic: str = Field(min_length=3, max_length=500)
+
+
+class BulkCustomContentRequest(_HasContentModel):
+    """Queue several custom topics in one call. Runs synchronously (like
+    `/custom-content/run`), so the list is capped - each topic is a full
+    generation pipeline. Topics that hit the plan's monthly content quota
+    are reported as skipped rather than failing the whole batch."""
+
+    topics: list[_Topic] = Field(min_length=1, max_length=10)
+
+
+class MultiModelContentRequest(BaseModel):
+    """Generate the same topic with several models at once, so a reviewer
+    can compare and keep the best. Each model is a full generation pipeline
+    and is metered/quota-checked individually (like the bulk endpoint), so
+    the model list is capped."""
+
+    topic: _Topic
+    models: list[str] = Field(min_length=2, max_length=4)
+
+    @field_validator("models")
+    @classmethod
+    def _check_models(cls, value: list[str]) -> list[str]:
+        seen: list[str] = []
+        for item in value:
+            resolved = validate_content_model(item)
+            if resolved is None:
+                raise ValueError("Model ids in `models` cannot be empty.")
+            if resolved not in seen:
+                seen.append(resolved)
+        if len(seen) < 2:
+            raise ValueError("`models` must name at least two distinct models to compare.")
+        return seen
 
 
 class ResearchPlan(BaseModel):

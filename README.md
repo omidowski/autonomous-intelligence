@@ -133,6 +133,104 @@ of the pipeline (including real video assembly) still runs end to end - `demo` m
 no model access" take the same fallback path. Video assembly uses `moviepy` + the `imageio-ffmpeg`
 bundled binary, no system `ffmpeg` required.
 
+## Choosing the content model
+
+Content and research generation can run on ChatGPT, Claude, Gemini or Grok - all through one
+OpenRouter key (`OPENROUTER_API_KEY`), no per-vendor SDK. `GET /auth/content-model-choices`
+lists the available ids.
+
+There are three levels, most specific wins:
+
+1. **Per request** - `"model"` in the body of `/research`, `/custom-content/run` and
+   `/custom-content/bulk`, or `?model=` on `/daily-content/run`.
+2. **Per company** - `PUT /auth/me/content-model` (owner only), the default for every run.
+3. **App default** - `AI_PROVIDER` / `Settings.resolved_provider` when neither is set.
+
+```bash
+curl -X POST http://localhost:8000/custom-content/run \
+  -H 'Content-Type: application/json' \
+  -d '{"topic":"agentic AI in logistics","model":"anthropic/claude-sonnet-5"}'
+```
+
+### Comparing models side by side
+
+`POST /custom-content/compare` generates the *same* topic with 2-4 models in one call and returns
+every run next to the others, so a reviewer can keep the best one. Each model is a full pipeline,
+metered and quota-checked on its own - a model that hits the monthly limit comes back as
+`skipped` instead of failing the batch.
+
+```bash
+curl -X POST http://localhost:8000/custom-content/compare \
+  -H 'Content-Type: application/json' \
+  -d '{"topic":"small language models","models":["anthropic/claude-sonnet-5","x-ai/grok-4.5"]}'
+```
+
+## Subscriptions, quotas and exports
+
+- **Billing** - real Stripe subscriptions: `/billing/plans`, `/billing/checkout`,
+  `/billing/portal`, `/billing/status`, and a signature-verified, idempotent `/billing/webhook`
+  that keeps `companies.subscription_plan`/`subscription_status` in sync with what Stripe
+  actually charged. With no Stripe key configured these return 503 rather than faking success.
+- **Plan quotas** - `plans.py` holds the monthly cap per plan per metered resource (`research`,
+  `content_runs`), counted from the same `usage_log` rows behind `/usage`. Over the cap, a
+  metered endpoint returns **402**. Every limit ships as `None` (unlimited), so enabling billing
+  does not retroactively lock existing companies out - set an integer to start enforcing.
+- **Exports** - `GET /research/{id}/export` and `GET /library/{run_id}/export` with
+  `?format=md|json|csv`, returned as a download.
+- **Bulk topics** - `POST /custom-content/bulk` runs up to 10 custom topics in one request,
+  skipping (not failing) the ones over quota.
+
+## Programmatic API keys
+
+Drive the product from your own scripts instead of a browser session.
+
+- `GET/POST/DELETE /api-keys` (owner only). The key is shown **once**, at creation;
+  only its SHA-256 is stored.
+- Use it as `Authorization: Bearer ai_live_...`.
+- Keys act with **member** permissions: they can run research, generate and review content,
+  publish, schedule and export - but cannot touch billing, team, webhooks or keys. A leaked
+  key therefore cannot escalate into the account.
+- Revocation takes effect on the next request; the row is kept so `last_used_at` stays
+  auditable.
+
+```bash
+curl -H "Authorization: Bearer $AI_KEY" http://localhost:8000/library
+```
+
+## Publishing calendar
+
+Approved content can be queued to go out later instead of only "publish now".
+
+- `POST /daily-content/{date}/trend/{n}/schedule` with `{"scheduled_for": "...", "platforms": [...]}`
+  queues one slot per platform. Re-posting the same slot is a no-op, not a duplicate.
+- `GET /schedule` is the calendar (filter with `?status=pending|published|failed|canceled`),
+  `DELETE /schedule/{id}` cancels a still-pending slot.
+- The existing scheduler loop drains due slots every 60s. Approval is re-checked at send
+  time: content rejected between scheduling and its slot is **failed, not posted**. A failed
+  slot is never retried, so a broken bundle can't cause a retry storm.
+
+### Real vs. stubbed platforms
+
+`GET /schedule/platforms` reports which platforms publish for real. LinkedIn, X and Facebook
+go live per platform as soon as that platform's credentials are set (see `.env.example`);
+everything else routes to the no-network stub publisher. Publishing to a platform whose
+credentials are missing is reported as a **failed** publish - a post that did not happen never
+looks like one that did.
+
+## Outbound webhooks
+
+Companies can subscribe to their own content events - the integration point competitors expose
+for Zapier/n8n-style automation.
+
+- `GET/POST/DELETE /webhooks` (owner only). The signing secret is returned **once**, at creation.
+- Events: `content.submitted_for_review`, `content.approved`, `content.rejected`,
+  `content.published`.
+- Each delivery is signed: `X-AI-Signature: sha256=<hmac-sha256 of the raw body>`, with the event
+  name in `X-AI-Event`.
+- Delivery is best-effort and never blocks or fails the API call that triggered it. Targets must
+  be public http(s) URLs - loopback, private and link-local addresses are rejected as a basic
+  SSRF guard.
+
 ## Workflow
 
 ```text
